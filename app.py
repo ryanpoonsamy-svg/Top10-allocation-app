@@ -1,4 +1,4 @@
-# app.py — Top 10 Allocation (Finnhub-powered)
+# app.py — Top 10 Allocation (Finnhub) with explicit FX used
 
 import io
 import os
@@ -11,7 +11,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-# ---------------- Page setup (wide & compact) ----------------
+# ---------------- Page setup (wide) ----------------
 st.set_page_config(page_title="Top 10 Allocation", layout="wide")
 st.markdown("""
 <style>
@@ -23,18 +23,16 @@ st.markdown("""
 TICKERS = ["AAPL","MSFT","NVDA","GOOGL","GOOG","AMZN","META","AVGO","TSLA","BRK-B"]
 DEFAULT_GBP_BUDGET = 37_000
 
-# Finnhub API key (from Streamlit Secrets or environment)
 API_KEY = st.secrets.get("FINNHUB_KEY") or os.environ.get("FINNHUB_KEY")
-
 BASE = "https://finnhub.io/api/v1"
+
+if not API_KEY:
+    st.error("Missing Finnhub API key. In Streamlit Cloud, go to ••• Manage app → Settings → Secrets and add:\n\nFINNHUB_KEY = \"YOUR_KEY_HERE\"")
+    st.stop()
 
 # ---------------- HTTP helper with retry ----------------
 def _get(url, params=None, retries=3, sleep=0.6):
-    """GET with exponential backoff; returns parsed JSON or None."""
-    if params is None:
-        params = {}
-    if not API_KEY:
-        return None
+    if params is None: params = {}
     params["token"] = API_KEY
     for i in range(retries):
         try:
@@ -46,55 +44,44 @@ def _get(url, params=None, retries=3, sleep=0.6):
         time.sleep(sleep * (2 ** i))
     return None
 
-# ---------------- Live FX (GBP→USD) with robust fallback ----------------
-@st.cache_data(ttl=60)
-def get_fx_gbp_usd():
+# ---------------- Live FX (returns BOTH directions used) ----------------
+@st.cache_data(ttl=30)
+def get_fx_rates():
     """
-    Returns (rate, source_note). Tries:
-      1) /forex/rates base=GBP → quote['USD']
-      2) /forex/candle for OANDA:GBP_USD last close
-      3) Fallback 1.25 if both unavailable
+    Returns: (gbp_to_usd, usd_to_gbp, source_note)
+      gbp_to_usd = USD per 1 GBP  (used to convert your £ budget to $)
+      usd_to_gbp = GBP per 1 USD  (used to convert $ allocations back to £)
     """
-    # Primary source
+    # Primary: aggregated rates with GBP as base
     data = _get(f"{BASE}/forex/rates", params={"base": "GBP"})
-    if data and isinstance(data.get("quote"), dict):
-        v = data["quote"].get("USD")
-        if v:
-            try:
-                return float(v), "Finnhub forex/rates"
-            except Exception:
-                pass
+    if data and isinstance(data.get("quote"), dict) and data["quote"].get("USD"):
+        gbp_to_usd = float(data["quote"]["USD"])
+        return gbp_to_usd, 1.0 / gbp_to_usd, "Finnhub forex/rates"
 
-    # Backup source (last candle close)
+    # Backup: last OANDA candle close for GBP/USD (5m window)
     now = int(time.time())
     candles = _get(
         f"{BASE}/forex/candle",
         params={"symbol": "OANDA:GBP_USD", "resolution": "5", "from": now - 3600, "to": now},
     )
     if candles and candles.get("s") == "ok" and candles.get("c"):
-        try:
-            return float(candles["c"][-1]), "Finnhub OANDA candle"
-        except Exception:
-            pass
+        gbp_to_usd = float(candles["c"][-1])
+        return gbp_to_usd, 1.0 / gbp_to_usd, "Finnhub OANDA candle"
 
-    return 1.25, "fallback 1.25"
+    # Final fallback (only if API unavailable)
+    gbp_to_usd = 1.25
+    return gbp_to_usd, 1.0 / gbp_to_usd, "fallback 1.25"
 
-# ---------------- Fetch prices + market caps from Finnhub ----------------
+# ---------------- Market data ----------------
 @st.cache_data(ttl=60)
 def fetch_data(tickers):
-    """
-    Uses:
-      - /quote → 'c' (current price, USD)
-      - /stock/profile2 → 'marketCapitalization' (USD billions)
-    Returns a DataFrame sorted by Market Cap (desc).
-    """
     rows = []
     for tk in tickers:
         q = _get(f"{BASE}/quote", params={"symbol": tk})
         p = _get(f"{BASE}/stock/profile2", params={"symbol": tk})
         try:
             price = float(q.get("c", 0)) if q else 0.0
-            mcap_bil = float(p.get("marketCapitalization", 0)) if p else 0.0
+            mcap_bil = float(p.get("marketCapitalization", 0)) if p else 0.0  # USD billions
             if price > 0 and mcap_bil > 0:
                 rows.append({"Ticker": tk, "Price": price, "Market Cap": mcap_bil * 1e9})
         except Exception:
@@ -105,7 +92,7 @@ def fetch_data(tickers):
     df["Market Cap ($T)"] = df["Market Cap"] / 1e12
     return df.sort_values("Market Cap", ascending=False).reset_index(drop=True)
 
-# ---------------- Pretty display formatting ----------------
+# ---------------- Formatting ----------------
 def format_for_display(df):
     d = df.copy()
     d["Price"] = d["Price"].map(lambda x: f"${x:,.2f}")
@@ -120,20 +107,14 @@ def format_for_display(df):
 # ---------------- UI ----------------
 st.title("Top 10 Stock Allocation")
 
-if not API_KEY:
-    st.error("Missing Finnhub API key. In Streamlit Cloud, go to ••• Manage app → Settings → Secrets and add:\n\n`FINNHUB_KEY = \"YOUR_KEY_HERE\"`")
-    st.stop()
-
 gbp_budget = st.number_input("💷 Allocation amount (£)", min_value=0, value=DEFAULT_GBP_BUDGET, step=1000)
 
 if st.button("🔄 Refresh Data"):
     with st.spinner("Fetching live data…"):
         df = fetch_data(TICKERS)
-        fx_gbpusd, fx_note = get_fx_gbp_usd()
-        usd_to_gbp = 1.0 / fx_gbpusd
-        usd_budget = gbp_budget * fx_gbpusd
+        gbp_to_usd, usd_to_gbp, fx_src = get_fx_rates()
+        usd_budget = gbp_budget * gbp_to_usd
 
-    # If Finnhub temporarily returns nothing, keep UX consistent
     if df.empty:
         st.warning("No data retrieved from Finnhub. Please try again shortly.")
         st.dataframe(
@@ -149,8 +130,6 @@ if st.button("🔄 Refresh Data"):
         df["Est. Shares"] = df["$ Allocation"] / df["Price"]
 
         out_df = df[["Ticker","Price","Market Cap","Market Cap ($T)","Weight %","$ Allocation","£ Allocation","Est. Shares"]]
-
-        # Nice rank index and full-width table with auto height
         out_df_display = out_df.copy()
         out_df_display.index = out_df_display.index + 1
         out_df_display.index.name = "Rank"
@@ -162,9 +141,12 @@ if st.button("🔄 Refresh Data"):
             height=(len(out_df_display) + 2) * row_height
         )
 
-        # Source + timestamp
         ts = datetime.now(ZoneInfo("Europe/London")).strftime("%Y-%m-%d %H:%M:%S")
-        st.caption(f"Data source: Finnhub.io | Updated {ts} | GBP→USD: {fx_gbpusd:.6f} ({fx_note})")
+        # 👉 Show the EXACT numbers used in the math (both directions)
+        st.caption(
+            f"Data source: Finnhub.io | Updated {ts} | "
+            f"GBP→USD used: {gbp_to_usd:.6f} | USD→GBP used: {usd_to_gbp:.6f} ({fx_src})"
+        )
 
         # Excel download
         buf = io.BytesIO()

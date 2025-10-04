@@ -1,7 +1,5 @@
 streamlit
-yfinance
 pandas
 numpy
+requests
 xlsxwriter
-lxml
-html5lib

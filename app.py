@@ -136,7 +136,7 @@ def format_for_display(df):
     return d
 
 # ---------------- UI ----------------
-st.title("Top 10 Stock Allocation")
+st.title("Top 10 S&P 500 Allocation")
 
 gbp_budget = st.number_input("💷 Allocation amount (£)", min_value=0, value=DEFAULT_GBP_BUDGET, step=1000)
 

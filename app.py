@@ -6,6 +6,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import io
 
+ALPHA_KEY = "V372Z9DESXEOD318"
+
 # ---------- PAGE SETUP ----------
 st.set_page_config(page_title="Top 10 Allocation", layout="centered")
 
@@ -13,26 +15,40 @@ st.set_page_config(page_title="Top 10 Allocation", layout="centered")
 TICKERS = ["AAPL","MSFT","NVDA","GOOGL","GOOG","AMZN","META","AVGO","TSLA","BRK-B"]
 
 # ---------- FUNCTIONS ----------
+import requests
+
 def fetch_data(tickers):
     rows = []
+    base_url = "https://www.alphavantage.co/query"
+
     for tk in tickers:
-        for _ in range(3):  # retry up to 3 times
-            try:
-                tkr = yf.Ticker(tk)
-                info = getattr(tkr, "fast_info", {}) or {}
-                price = info.get("last_price")
-                mcap = info.get("market_cap")
-                if price and mcap:
-                    rows.append({"Ticker": tk, "Price": price, "Market Cap": mcap})
-                    break
-            except Exception:
+        try:
+            params = {"function": "GLOBAL_QUOTE", "symbol": tk, "apikey": ALPHA_KEY}
+            r = requests.get(base_url, params=params, timeout=10)
+            data = r.json().get("Global Quote", {})
+            if not data:
                 continue
+
+            price = float(data.get("05. price", 0))
+            mcap = float(data.get("06. market cap", 0)) if "06. market cap" in data else np.nan
+
+            # Fallback if market cap missing (approximate using trailing shares)
+            if np.isnan(mcap) or mcap == 0:
+                # optional: skip if no mcap data
+                continue
+
+            rows.append({"Ticker": tk, "Price": price, "Market Cap": mcap})
+
+        except Exception:
+            continue
+
     df = pd.DataFrame(rows)
     if df.empty:
-        st.warning("⚠️ No data retrieved from Yahoo Finance. Please try again in a minute (Yahoo may be throttling requests).")
+        st.warning("⚠️ No data retrieved from Alpha Vantage. Try again soon (API limit 5 calls/minute).")
         return pd.DataFrame(columns=["Ticker", "Price", "Market Cap", "Market Cap ($T)"])
     df["Market Cap ($T)"] = df["Market Cap"] / 1e12
     return df.sort_values("Market Cap", ascending=False)
+
 
 def get_fx():
     fx = yf.Ticker("GBPUSD=X")

@@ -1,4 +1,4 @@
-# app.py — Top 10 Allocation (Finnhub) with explicit FX used
+# app.py — Top 10 Allocation (Finnhub) with robust FX + spacing fixes
 
 import io
 import os
@@ -11,11 +11,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-# ---------------- Page setup (wide) ----------------
+# ---------------- Page setup (wide + comfortable top spacing) ----------------
 st.set_page_config(page_title="Top 10 Allocation", layout="wide")
 st.markdown("""
 <style>
-  .block-container { max-width: 1400px; padding-top: 0.5rem; padding-bottom: 0.5rem; }
+  .block-container { max-width: 1400px; padding-top: 1.5rem; padding-bottom: 0.75rem; }
+  h1, .h1 { margin-top: .25rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -27,7 +28,7 @@ API_KEY = st.secrets.get("FINNHUB_KEY") or os.environ.get("FINNHUB_KEY")
 BASE = "https://finnhub.io/api/v1"
 
 if not API_KEY:
-    st.error("Missing Finnhub API key. In Streamlit Cloud, go to ••• Manage app → Settings → Secrets and add:\n\nFINNHUB_KEY = \"YOUR_KEY_HERE\"")
+    st.error("Missing Finnhub API key. In Streamlit Cloud: ••• Manage app → Settings → Secrets → add\n\nFINNHUB_KEY = \"YOUR_KEY_HERE\"")
     st.stop()
 
 # ---------------- HTTP helper with retry ----------------
@@ -44,35 +45,59 @@ def _get(url, params=None, retries=3, sleep=0.6):
         time.sleep(sleep * (2 ** i))
     return None
 
-# ---------------- Live FX (returns BOTH directions used) ----------------
+# ---------------- Live FX (GBP→USD) w/ multi-source fallback ----------------
 @st.cache_data(ttl=30)
 def get_fx_rates():
     """
     Returns: (gbp_to_usd, usd_to_gbp, source_note)
-      gbp_to_usd = USD per 1 GBP  (used to convert your £ budget to $)
-      usd_to_gbp = GBP per 1 USD  (used to convert $ allocations back to £)
+    Order of attempts:
+      1) Finnhub /forex/rates (base=GBP)
+      2) Finnhub OANDA candles (GBP/USD, last close)
+      3) exchangerate.host (ECB) latest
+      4) Final fallback 1.25 (flagged)
     """
-    # Primary: aggregated rates with GBP as base
+    # 1) Finnhub aggregated rates (base=GBP)
     data = _get(f"{BASE}/forex/rates", params={"base": "GBP"})
-    if data and isinstance(data.get("quote"), dict) and data["quote"].get("USD"):
-        gbp_to_usd = float(data["quote"]["USD"])
-        return gbp_to_usd, 1.0 / gbp_to_usd, "Finnhub forex/rates"
+    if data and isinstance(data.get("quote"), dict):
+        v = data["quote"].get("USD")
+        if v:
+            try:
+                gbp_to_usd = float(v)
+                return gbp_to_usd, 1.0 / gbp_to_usd, "Finnhub forex/rates"
+            except Exception:
+                pass
 
-    # Backup: last OANDA candle close for GBP/USD (5m window)
+    # 2) Finnhub OANDA candles (try a couple of resolutions)
     now = int(time.time())
-    candles = _get(
-        f"{BASE}/forex/candle",
-        params={"symbol": "OANDA:GBP_USD", "resolution": "5", "from": now - 3600, "to": now},
-    )
-    if candles and candles.get("s") == "ok" and candles.get("c"):
-        gbp_to_usd = float(candles["c"][-1])
-        return gbp_to_usd, 1.0 / gbp_to_usd, "Finnhub OANDA candle"
+    for res in ("1", "5", "15"):
+        candles = _get(
+            f"{BASE}/forex/candle",
+            params={"symbol": "OANDA:GBP_USD", "resolution": res, "from": now - 6*3600, "to": now},
+        )
+        if candles and candles.get("s") == "ok" and candles.get("c"):
+            try:
+                gbp_to_usd = float(candles["c"][-1])
+                if gbp_to_usd > 0:
+                    return gbp_to_usd, 1.0 / gbp_to_usd, f"Finnhub OANDA candle {res}m"
+            except Exception:
+                pass
 
-    # Final fallback (only if API unavailable)
+    # 3) Public ECB rates via exchangerate.host
+    try:
+        r = requests.get("https://api.exchangerate.host/latest", params={"base": "GBP", "symbols": "USD"}, timeout=10)
+        j = r.json()
+        v = j.get("rates", {}).get("USD")
+        if v and float(v) > 0:
+            gbp_to_usd = float(v)
+            return gbp_to_usd, 1.0 / gbp_to_usd, "exchangerate.host (ECB)"
+    except Exception:
+        pass
+
+    # 4) Last resort
     gbp_to_usd = 1.25
     return gbp_to_usd, 1.0 / gbp_to_usd, "fallback 1.25"
 
-# ---------------- Market data ----------------
+# ---------------- Market data from Finnhub ----------------
 @st.cache_data(ttl=60)
 def fetch_data(tickers):
     rows = []
@@ -92,7 +117,7 @@ def fetch_data(tickers):
     df["Market Cap ($T)"] = df["Market Cap"] / 1e12
     return df.sort_values("Market Cap", ascending=False).reset_index(drop=True)
 
-# ---------------- Formatting ----------------
+# ---------------- Display formatting ----------------
 def format_for_display(df):
     d = df.copy()
     d["Price"] = d["Price"].map(lambda x: f"${x:,.2f}")
@@ -142,13 +167,12 @@ if st.button("🔄 Refresh Data"):
         )
 
         ts = datetime.now(ZoneInfo("Europe/London")).strftime("%Y-%m-%d %H:%M:%S")
-        # 👉 Show the EXACT numbers used in the math (both directions)
         st.caption(
             f"Data source: Finnhub.io | Updated {ts} | "
             f"GBP→USD used: {gbp_to_usd:.6f} | USD→GBP used: {usd_to_gbp:.6f} ({fx_src})"
         )
 
-        # Excel download
+        # Excel download (same data as shown)
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
             out_df.to_excel(writer, index=False, sheet_name="Allocation")

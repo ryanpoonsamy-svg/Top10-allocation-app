@@ -1,4 +1,4 @@
-# app.py — Top 10 Allocation (accurate FX + 1.35 fallback)
+# app.py — Top 10 Allocation (accurate FX + effective rate display)
 
 import io
 import os
@@ -54,7 +54,7 @@ def get_fx_rates():
       1) ECB via exchangerate.host
       2) Finnhub /forex/rates (base=GBP)
       3) Finnhub OANDA candles
-      4) Fallback 1.35 (clearly labeled)
+      4) Fallback 1.35
     """
     # 1) ECB (exchangerate.host)
     try:
@@ -96,7 +96,7 @@ def get_fx_rates():
             except Exception:
                 pass
 
-    # 4) Fallback — use 1.35 instead of 1.25
+    # 4) Fallback — use 1.35
     gbp_to_usd = 1.35
     return gbp_to_usd, 1.0 / gbp_to_usd, "fallback 1.35"
 
@@ -165,6 +165,7 @@ if st.button("🔄 Refresh Data"):
         out_df_display.index = out_df_display.index + 1
         out_df_display.index.name = "Rank"
 
+        # Display the table
         row_height = 36
         st.dataframe(
             format_for_display(out_df_display),
@@ -172,15 +173,27 @@ if st.button("🔄 Refresh Data"):
             height=(len(out_df_display) + 2) * row_height
         )
 
+        # Compute effective conversion rate from allocations
+        effective_rate = out_df["$ Allocation"].iloc[0] / out_df["£ Allocation"].iloc[0]
+        inverse_rate = 1 / effective_rate
+
         ts = datetime.now(ZoneInfo("Europe/London")).strftime("%Y-%m-%d %H:%M:%S")
         st.caption(
             f"Data source: Finnhub.io | Updated {ts} | "
-            f"GBP→USD used: {gbp_to_usd:.6f} | USD→GBP used: {usd_to_gbp:.6f} ({fx_src})"
+            f"Effective GBP→USD used: {effective_rate:.6f} | USD→GBP used: {inverse_rate:.6f}"
         )
 
+        # Excel download (same data as shown)
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
             out_df.to_excel(writer, index=False, sheet_name="Allocation")
+
+            # Write rate & timestamp below table
+            ws = writer.sheets["Allocation"]
+            nrows = len(out_df) + 3
+            ws.write(nrows, 0, f"Effective GBP→USD rate used: {effective_rate:.6f}")
+            ws.write(nrows + 1, 0, f"Updated: {ts}")
+
         st.download_button(
             "⬇️ Download Excel",
             data=buf.getvalue(),

@@ -16,22 +16,23 @@ TICKERS = ["AAPL","MSFT","NVDA","GOOGL","GOOG","AMZN","META","AVGO","TSLA","BRK-
 def fetch_data(tickers):
     rows = []
     for tk in tickers:
-        try:
-            tkr = yf.Ticker(tk)
-            info = getattr(tkr, "fast_info", {}) or {}
-            price = info.get("last_price")
-            mcap = info.get("market_cap")
-            if not price or not mcap:
+        for _ in range(3):  # retry up to 3 times
+            try:
+                tkr = yf.Ticker(tk)
+                info = getattr(tkr, "fast_info", {}) or {}
+                price = info.get("last_price")
+                mcap = info.get("market_cap")
+                if price and mcap:
+                    rows.append({"Ticker": tk, "Price": price, "Market Cap": mcap})
+                    break
+            except Exception:
                 continue
-            rows.append({"Ticker": tk, "Price": price, "Market Cap": mcap})
-        except Exception:
-            continue  # skip tickers that fail
     df = pd.DataFrame(rows)
     if df.empty:
+        st.warning("⚠️ No data retrieved from Yahoo Finance. Please try again in a minute (Yahoo may be throttling requests).")
         return pd.DataFrame(columns=["Ticker", "Price", "Market Cap", "Market Cap ($T)"])
     df["Market Cap ($T)"] = df["Market Cap"] / 1e12
     return df.sort_values("Market Cap", ascending=False)
-
 
 def get_fx():
     fx = yf.Ticker("GBPUSD=X")

@@ -1,4 +1,4 @@
-# app.py — Top 10 Allocation (effective FX from table totals + robust FX sources + diagnostics)
+# app.py — Top 10 Allocation (FX override + effective rate + Frankfurter ECB)
 
 import io
 import os
@@ -47,80 +47,6 @@ def _get_finnhub(path, params=None, retries=3, sleep=0.6):
     return None
 
 @st.cache_data(ttl=60)
-def get_fx_gbp_usd_with_sources():
-    """
-    Return (gbp_to_usd, usd_to_gbp, source_note, details_dict)
-    Tries:
-      1) ECB via exchangerate.host (GBP base)
-      2) ECB via exchangerate.host (USD base, inverted)
-      3) Finnhub /forex/rates (base=GBP)
-      4) Finnhub OANDA candles (GBP/USD) last close
-      5) Fallback 1.35
-    """
-    details = {}
-
-    # 1) ECB (GBP base)
-    try:
-        r = requests.get("https://api.exchangerate.host/latest",
-                         params={"base": "GBP", "symbols": "USD"}, timeout=10)
-        j = r.json()
-        details["ecb_gbp_base_raw"] = j
-        v = j.get("rates", {}).get("USD")
-        if v and float(v) > 0:
-            gbp_to_usd = float(v)
-            return gbp_to_usd, 1.0 / gbp_to_usd, "ECB (GBP base)", details
-    except Exception as e:
-        details["ecb_gbp_base_error"] = str(e)
-
-    # 2) ECB (USD base) → invert
-    try:
-        r = requests.get("https://api.exchangerate.host/latest",
-                         params={"base": "USD", "symbols": "GBP"}, timeout=10)
-        j = r.json()
-        details["ecb_usd_base_raw"] = j
-        v = j.get("rates", {}).get("GBP")
-        if v and float(v) > 0:
-            usd_to_gbp = float(v)
-            gbp_to_usd = 1.0 / usd_to_gbp
-            return gbp_to_usd, usd_to_gbp, "ECB (USD base, inverted)", details
-    except Exception as e:
-        details["ecb_usd_base_error"] = str(e)
-
-    # 3) Finnhub aggregated
-    data = _get_finnhub("forex/rates", params={"base": "GBP"})
-    details["finnhub_rates_raw"] = data
-    if data and isinstance(data.get("quote"), dict):
-        v = data["quote"].get("USD")
-        if v:
-            try:
-                gbp_to_usd = float(v)
-                return gbp_to_usd, 1.0 / gbp_to_usd, "Finnhub forex/rates", details
-            except Exception as e:
-                details["finnhub_rates_parse_error"] = str(e)
-
-    # 4) Finnhub OANDA candles
-    now = int(time.time())
-    for res in ("1", "5", "15"):
-        candles = _get_finnhub("forex/candle",
-                               params={"symbol": "OANDA:GBP_USD",
-                                       "resolution": res,
-                                       "from": now - 6*3600,
-                                       "to": now})
-        details[f"finnhub_candle_{res}m_raw"] = candles
-        if candles and candles.get("s") == "ok" and candles.get("c"):
-            try:
-                gbp_to_usd = float(candles["c"][-1])
-                if gbp_to_usd > 0:
-                    return gbp_to_usd, 1.0 / gbp_to_usd, f"Finnhub OANDA candle {res}m", details
-            except Exception as e:
-                details[f"finnhub_candle_{res}m_parse_error"] = str(e)
-
-    # 5) Fallback
-    gbp_to_usd = 1.35
-    details["fallback_used"] = True
-    return gbp_to_usd, 1.0 / gbp_to_usd, "fallback 1.35", details
-
-@st.cache_data(ttl=60)
 def fetch_data(tickers):
     rows = []
     for tk in tickers:
@@ -139,6 +65,65 @@ def fetch_data(tickers):
     df["Market Cap ($T)"] = df["Market Cap"] / 1e12
     return df.sort_values("Market Cap", ascending=False).reset_index(drop=True)
 
+# -------- FX: Frankfurter (ECB) → Finnhub → fallback 1.35 --------
+@st.cache_data(ttl=60)
+def get_fx_gbp_usd_with_sources():
+    """
+    Return (gbp_to_usd, usd_to_gbp, source_note, details)
+      1) Frankfurter.app (ECB) — no API key required
+      2) Finnhub /forex/rates base=GBP
+      3) Finnhub OANDA candles last close
+      4) Fallback 1.35
+    """
+    details = {}
+
+    # 1) Frankfurter (ECB)
+    try:
+        r = requests.get("https://api.frankfurter.app/latest",
+                         params={"from": "GBP", "to": "USD"}, timeout=10)
+        j = r.json()
+        details["frankfurter_raw"] = j
+        v = j.get("rates", {}).get("USD")
+        if v and float(v) > 0:
+            gbp_to_usd = float(v)
+            return gbp_to_usd, 1.0 / gbp_to_usd, "Frankfurter (ECB)", details
+    except Exception as e:
+        details["frankfurter_error"] = str(e)
+
+    # 2) Finnhub aggregated rates
+    data = _get_finnhub("forex/rates", params={"base": "GBP"})
+    details["finnhub_rates_raw"] = data
+    if data and isinstance(data.get("quote"), dict):
+        v = data["quote"].get("USD")
+        if v:
+            try:
+                gbp_to_usd = float(v)
+                return gbp_to_usd, 1.0 / gbp_to_usd, "Finnhub forex/rates", details
+            except Exception as e:
+                details["finnhub_rates_parse_error"] = str(e)
+
+    # 3) Finnhub OANDA candles
+    now = int(time.time())
+    for res in ("1", "5", "15"):
+        candles = _get_finnhub("forex/candle",
+                               params={"symbol": "OANDA:GBP_USD",
+                                       "resolution": res,
+                                       "from": now - 6*3600,
+                                       "to": now})
+        details[f"finnhub_candle_{res}m_raw"] = candles
+        if candles and candles.get("s") == "ok" and candles.get("c"):
+            try:
+                gbp_to_usd = float(candles["c"][-1])
+                if gbp_to_usd > 0:
+                    return gbp_to_usd, 1.0 / gbp_to_usd, f"Finnhub OANDA candle {res}m", details
+            except Exception as e:
+                details[f"finnhub_candle_{res}m_parse_error"] = str(e)
+
+    # 4) Fallback
+    gbp_to_usd = 1.35
+    details["fallback_used"] = True
+    return gbp_to_usd, 1.0 / gbp_to_usd, "fallback 1.35", details
+
 def format_for_display(df):
     d = df.copy()
     d["Price"] = d["Price"].map(lambda x: f"${x:,.2f}")
@@ -155,22 +140,30 @@ st.title("Top 10 Stock Allocation")
 
 gbp_budget = st.number_input("💷 Allocation amount (£)", min_value=0, value=DEFAULT_GBP_BUDGET, step=1000)
 
+use_override = st.checkbox("⚙️ Use custom GBP→USD exchange rate")
+override_rate = None
+if use_override:
+    override_rate = st.number_input("Enter your custom GBP→USD rate", min_value=0.5, max_value=3.0, value=1.35, step=0.01)
+
 if st.button("🔄 Refresh Data"):
-    # Clear caches each refresh so we don't reuse a fallback unintentionally
     st.cache_data.clear()
 
     with st.spinner("Fetching live data…"):
         df = fetch_data(TICKERS)
         gbp_to_usd, usd_to_gbp, fx_src, fx_details = get_fx_gbp_usd_with_sources()
+
+        if use_override and override_rate:
+            gbp_to_usd = override_rate
+            usd_to_gbp = 1 / override_rate
+            fx_src = f"Custom override ({override_rate:.4f})"
+
         usd_budget = gbp_budget * gbp_to_usd
 
     if df.empty:
         st.warning("No data retrieved from Finnhub. Please try again shortly.")
-        st.dataframe(
-            pd.DataFrame(columns=["Ticker","Price","Market Cap","Market Cap ($T)","Weight %","$ Allocation","£ Allocation","Est. Shares"]),
-            use_container_width=True,
-            height=240
-        )
+        st.dataframe(pd.DataFrame(columns=[
+            "Ticker","Price","Market Cap","Market Cap ($T)","Weight %","$ Allocation","£ Allocation","Est. Shares"
+        ]), use_container_width=True, height=240)
     else:
         total_mcap = df["Market Cap"].sum()
         df["Weight %"] = df["Market Cap"] / total_mcap
@@ -183,18 +176,13 @@ if st.button("🔄 Refresh Data"):
         out_df_display.index = out_df_display.index + 1
         out_df_display.index.name = "Rank"
 
-        # Full-width table
         row_height = 36
-        st.dataframe(
-            format_for_display(out_df_display),
-            use_container_width=True,
-            height=(len(out_df_display) + 2) * row_height
-        )
+        st.dataframe(format_for_display(out_df_display), use_container_width=True,
+                     height=(len(out_df_display) + 2) * row_height)
 
-        # --- Compute EFFECTIVE FX from totals (exactly matches table math) ---
+        # Effective FX from totals
         total_usd = float(out_df["$ Allocation"].sum())
         total_gbp = float(out_df["£ Allocation"].sum())
-        # Protect against division by zero
         effective_rate = (total_usd / total_gbp) if total_gbp else float("nan")
         inverse_rate = (1.0 / effective_rate) if (effective_rate and effective_rate > 0) else float("nan")
 
@@ -202,10 +190,10 @@ if st.button("🔄 Refresh Data"):
         st.caption(
             f"Data source: Finnhub.io | Updated {ts} | "
             f"Effective GBP→USD used: {effective_rate:.6f} | USD→GBP used: {inverse_rate:.6f} "
-            f"(FX source tried: {fx_src})"
+            f"(FX source: {fx_src})"
         )
 
-        # Download Excel (with effective rate + timestamp written under the table)
+        # Excel download
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
             out_df.to_excel(writer, index=False, sheet_name="Allocation")
